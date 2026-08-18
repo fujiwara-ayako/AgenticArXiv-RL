@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from utils.llm_client import LLMClient
 from tools.tool_registry import registry
-from agents.base_agent import BaseAgent
+from agents.base_agent import BaseAgent, PARSE_FAILED
 from agents.prompt_templates import get_react_prompt, format_tool_description
 from utils.logger import log
 
@@ -17,8 +17,20 @@ from utils.logger import log
 class ReActAgent(BaseAgent):
     """方案 A: ReAct + 正则解析 Agent"""
 
-    def __init__(self, llm_client: LLMClient):
-        super().__init__(llm_client)
+    def __init__(self, llm_client: LLMClient, side_effect_mgr=None, env=None,
+                 max_iterations: int = 5, strict_parse: bool = False):
+        """
+        Args:
+            strict_parse: True 时禁用"文本降级提取"。
+
+                降级提取会在 JSON 解析失败后，只要文本里出现过工具名就把调用救回来。
+                线上这是有用的鲁棒性；但在 RL 里它会**掩盖解析失败**——
+                prompt 明令要求严格 JSON，策略却发现写错也能被系统修好，
+                parse_failures 永远是 0，模型自然学不会遵守格式。
+                因此离线训练/评测默认应开启 strict_parse。
+        """
+        super().__init__(llm_client, side_effect_mgr=side_effect_mgr, env=env, max_iterations=max_iterations)
+        self.strict_parse = strict_parse
         try:
             import tools.arxiv_tool  # noqa: F401
             import tools.pdf_download_tool  # noqa: F401
@@ -74,6 +86,11 @@ class ReActAgent(BaseAgent):
             log.info("Agent决定结束任务")
             return thought, None
 
+        # 模型压根没输出 Action 段 → 视为解析失败，而非 FINISH
+        if not action_text:
+            log.error("响应中未找到 Action 段")
+            return thought, PARSE_FAILED
+
         # JSON 解析
         try:
             json_match = re.search(r"({.*})", action_text, re.DOTALL)
@@ -95,6 +112,10 @@ class ReActAgent(BaseAgent):
                     return thought, action_dict
         except json.JSONDecodeError as e:
             log.error(f"JSON解析失败: {e}, Action文本: {action_text}")
+
+        if self.strict_parse:
+            log.error(f"strict_parse=True，不做降级提取，判定为解析失败: {action_text[:120]}")
+            return thought, PARSE_FAILED
 
         # 文本降级提取
         log.warning("尝试从文本中提取工具调用信息")
@@ -118,4 +139,4 @@ class ReActAgent(BaseAgent):
                 return thought, {"name": tool_name, "args": args}
 
         log.error(f"无法解析Action: {action_text}")
-        return thought, None
+        return thought, PARSE_FAILED

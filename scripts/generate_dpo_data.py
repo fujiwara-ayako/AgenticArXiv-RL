@@ -1,117 +1,119 @@
-"""从 SFT 模型 rollout 生成 DPO 训练数据
+"""生成 DPO 偏好数据（chosen / rejected）。
 
-DPO 数据格式：
-- 每条数据包含 (prompt, chosen, rejected)
-- chosen: reward 最高的 action
-- rejected: reward 最低的 action
+用法：
+    python scripts/generate_dpo_data.py --n 8 --error_rate 0.45
 
-策略：
-1. 用 SFT 模型对每个 task rollout 多次（如 5 次）
-2. 按 reward 排序，reward 最高的作为 chosen，最低的作为 rejected
-3. 构造 DPO 格式
+与旧版的区别
+------------
+旧版取 `history[-1]["action"]` 作为 chosen/rejected，但**成功轨迹的最后一步动作
+恒为字符串 "FINISH"**，于是 `chosen == rejected` → 全部被 `continue` 跳过，
+实测产出 0 条样本；即便偶有产出，比较的也是终止标记而非工具选择偏好。
 
-运行方式：
-    python scripts/generate_dpo_data.py
+现在按「同一状态下的不同动作」构造偏好对：
+
+    1. 每个任务用带噪策略采样 N 条轨迹，记录每一步真实的 (prompt, completion)
+    2. 按 prompt 字符串分组 —— 同一个 prompt 就是同一个状态
+       （ReAct prompt 里已经包含任务 + 完整历史，能唯一确定状态）
+    3. 组内按所属轨迹的 return 排序，最高 vs 最低构成一对
+    4. 过滤掉 completion 相同、或 return 差距过小的对
+
+这本质上是 advantage-weighted preference：同状态下，偏好导致更高回报的动作。
 """
 
-import sys
+import argparse
 import json
+import os
+import sys
+from collections import defaultdict
 from pathlib import Path
 
-# 添加 AgenticArxiv 到 Python 路径
-sys.path.insert(0, str(Path(__file__).parent.parent / "AgenticArxiv"))
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT / "AgenticArxiv"))
+os.environ.setdefault("STORE_BACKEND", "memory")
 
-from benchmark.tasks import get_all_tasks
-from agents.agent_engine import ReActAgent
-from agents.side_effects import NoOpSideEffectManager
-from utils.llm_client import get_env_llm_client
-from rl.reward import RewardCalculator
+from rl.rollout import make_env, rollout_once  # noqa: E402
+from rl.tasks import split_train_eval  # noqa: E402
 
 
-def generate_dpo_dataset(num_rollouts_per_task: int = 5):
-    """
-    从 SFT 模型 rollout 生成 DPO 数据集
+def generate(
+    output: str = "data/dpo/dpo_train.jsonl",
+    backend: str = "noisy",
+    n: int = 8,
+    error_rate: float = 0.45,
+    seed: int = 0,
+    min_margin: float = 0.3,
+    holdout: bool = True,
+):
+    tasks, eval_tasks = split_train_eval() if holdout else (None, [])
+    if tasks is None:
+        from rl.tasks import get_extended_tasks
+        tasks = get_extended_tasks()
 
-    Args:
-        num_rollouts_per_task: 每个任务 rollout 次数
-    """
+    env = make_env()
+    print(f"DPO 数据生成 | 策略={backend} 任务={len(tasks)} 每任务{n}条 最小 margin={min_margin}")
 
-    sft_model_path = Path("outputs/sft/final")
-    if not sft_model_path.exists():
-        print(f"❌ SFT 模型不存在: {sft_model_path}")
-        print(f"请先运行: python -m rl.train_sft")
-        return
+    pairs = []
+    for task_def in tasks:
+        # state(prompt) -> [(return, completion)]
+        by_state = defaultdict(list)
+        rewards = []
 
-    # TODO: 加载 SFT 模型（需要修改 llm_client 支持本地模型）
-    # 目前占位：使用原始 LLM
-    llm_client = get_env_llm_client()
-    agent = ReActAgent(llm_client, side_effect_mgr=NoOpSideEffectManager())
+        for trial in range(n):
+            result, reward, _ = rollout_once(
+                task_def, env, backend=backend, trial=trial,
+                seed=seed, error_rate=error_rate,
+            )
+            rewards.append(reward)
+            for rec in result.get("records", []):
+                key = json.dumps(rec["messages"], ensure_ascii=False, sort_keys=True)
+                by_state[key].append((reward, rec["completion"], rec["messages"]))
 
-    reward_calc = RewardCalculator()
-    dpo_data = []
-    tasks = get_all_tasks()
+        made = 0
+        for _, entries in by_state.items():
+            if len(entries) < 2:
+                continue
+            entries.sort(key=lambda x: x[0], reverse=True)
+            best, worst = entries[0], entries[-1]
+            if best[1] == worst[1]:
+                continue                      # 同一个动作，没有偏好信息
+            if best[0] - worst[0] < min_margin:
+                continue                      # 回报差距太小，信号噪声比低
+            pairs.append({
+                "prompt": best[2],
+                "chosen": [{"role": "assistant", "content": best[1]}],
+                "rejected": [{"role": "assistant", "content": worst[1]}],
+            })
+            made += 1
 
-    print(f"📚 共 {len(tasks)} 个任务，每个 rollout {num_rollouts_per_task} 次")
+        span = f"{min(rewards):+.2f}~{max(rewards):+.2f}" if rewards else "n/a"
+        print(f"  {task_def['id']:<15} reward范围={span:<14} 新增偏好对={made}")
 
-    for i, task_def in enumerate(tasks):
-        print(f"\n[{i+1}/{len(tasks)}] 任务: {task_def['id']} - {task_def['task']}")
-
-        rollouts = []
-
-        for j in range(num_rollouts_per_task):
-            try:
-                result = agent.run(
-                    task_def["task"],
-                    session_id=f"dpo_gen_{task_def['id']}_r{j}"
-                )
-                reward, metrics = reward_calc.compute_reward(task_def, result)
-                rollouts.append({
-                    "result": result,
-                    "reward": reward,
-                    "metrics": metrics,
-                })
-                print(f"   rollout {j+1}: reward={reward:.2f}")
-
-            except Exception as e:
-                print(f"   rollout {j+1}: ❌ {e}")
-
-        if len(rollouts) < 2:
-            print(f"   ⚠️  rollout 数量不足，跳过")
-            continue
-
-        # 排序
-        rollouts.sort(key=lambda x: x["reward"], reverse=True)
-
-        # 取最优和最差
-        best = rollouts[0]
-        worst = rollouts[-1]
-
-        # 提取最后一步的 action（或第一步，取决于策略）
-        best_action = best["result"]["history"][-1].get("action", "") if best["result"]["history"] else ""
-        worst_action = worst["result"]["history"][-1].get("action", "") if worst["result"]["history"] else ""
-
-        if not best_action or not worst_action or best_action == worst_action:
-            print(f"   ⚠️  chosen/rejected 无效，跳过")
-            continue
-
-        dpo_data.append({
-            "prompt": task_def["task"],
-            "chosen": best_action,
-            "rejected": worst_action,
-        })
-
-        print(f"   ✅ chosen_reward={best['reward']:.2f}, rejected_reward={worst['reward']:.2f}")
-
-    # 保存到 JSONL
-    output_path = Path("data/dpo/dpo_train.jsonl")
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    with open(output_path, "w", encoding="utf-8") as f:
-        for item in dpo_data:
+    out_path = REPO_ROOT / output
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        for item in pairs:
             f.write(json.dumps(item, ensure_ascii=False) + "\n")
 
-    print(f"\n✅ DPO 数据生成完成：{len(dpo_data)} 条样本 → {output_path}")
+    print(f"\nDPO 偏好对 {len(pairs)} 条 → {out_path}")
+    return pairs
+
+
+def main():
+    p = argparse.ArgumentParser(description="生成 DPO 偏好数据")
+    p.add_argument("--output", default="data/dpo/dpo_train.jsonl")
+    p.add_argument("--backend", default="noisy")
+    p.add_argument("--n", type=int, default=8)
+    p.add_argument("--error_rate", type=float, default=0.45)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--min_margin", type=float, default=0.3)
+    p.add_argument("--no-holdout", dest="holdout", action="store_false")
+    args = p.parse_args()
+    generate(
+        output=args.output, backend=args.backend, n=args.n,
+        error_rate=args.error_rate, seed=args.seed,
+        min_margin=args.min_margin, holdout=args.holdout,
+    )
 
 
 if __name__ == "__main__":
-    generate_dpo_dataset()
+    main()

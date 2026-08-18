@@ -1,7 +1,10 @@
 # ===== RL 训练核心依赖 =====
+# 训练脚本使用 TRL 的现行 API（processing_class / max_length /
+# GRPOTrainer(reward_funcs=...) / GRPOConfig(num_generations=...)），
+# 这些在 trl<0.13 上不存在，因此这里给出实际验证过的下限。
 torch>=2.0.0
-transformers>=4.35.0
-trl>=0.8.0
+transformers>=4.45.0
+trl>=0.15.0
 datasets>=2.14.0
 accelerate>=0.25.0
 
@@ -15,3 +18,7 @@ fire
 
 # ===== 可选依赖（eval/demo 时需要，训练时不需要） =====
 # pdf2zh  # PDF 翻译（训练时用 mock）
+#
+# 注意：以上依赖已经足够跑完整条 RL 链路（rollout / SFT / DPO / GRPO）。
+# fastapi / sqlalchemy / pymysql 只有跑 Web 应用时才需要，见 requirements-extra.txt。
+# RL 路径通过 STORE_BACKEND=memory + agents/side_effects.py 与它们完全解耦。

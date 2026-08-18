@@ -18,7 +18,7 @@ if PROJECT_ROOT not in sys.path:
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-from agents.base_agent import BaseAgent
+from agents.base_agent import BaseAgent, PARSE_FAILED
 from agents.prompt_templates import get_react_prompt, format_tool_description
 from utils.llm_client import LLMClient
 from utils.logger import log
@@ -31,8 +31,8 @@ class MCPAgent(BaseAgent):
     """通过 MCP 协议调用工具的 Agent"""
     agent_type = "mcp"
 
-    def __init__(self, llm_client: LLMClient):
-        super().__init__(llm_client)
+    def __init__(self, llm_client: LLMClient, side_effect_mgr=None, env=None, max_iterations: int = 5):
+        super().__init__(llm_client, side_effect_mgr=side_effect_mgr, env=env, max_iterations=max_iterations)
         self._session: Optional[ClientSession] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._mcp_tools: List[Dict[str, Any]] = []
@@ -180,6 +180,10 @@ class MCPAgent(BaseAgent):
         if action_text.upper() == "FINISH":
             return thought, None
 
+        if not action_text:
+            log.error("响应中未找到 Action 段")
+            return thought, PARSE_FAILED
+
         try:
             json_match = re.search(r"({.*})", action_text, re.DOTALL)
             if json_match:
@@ -195,4 +199,4 @@ class MCPAgent(BaseAgent):
             pass
 
         log.error(f"无法解析Action: {action_text}")
-        return thought, None
+        return thought, PARSE_FAILED

@@ -14,7 +14,9 @@ traces/
 outputs/
 data/sft/*.jsonl
 data/dpo/*.jsonl
+data/grpo/*.jsonl
 data/mock_arxiv_snapshot.json
+eval/results/
 
 # 环境配置
 .env

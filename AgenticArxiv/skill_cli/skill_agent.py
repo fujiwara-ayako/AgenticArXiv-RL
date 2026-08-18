@@ -15,7 +15,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from agents.base_agent import BaseAgent
+from agents.base_agent import BaseAgent, PARSE_FAILED
 from utils.llm_client import LLMClient
 from utils.logger import log
 from skill_cli.skill_prompt import get_skill_prompt
@@ -38,8 +38,8 @@ class SkillAgent(BaseAgent):
     """通过 Skill 文档 + CLI 子进程执行工具的 Agent"""
     agent_type = "skill_cli"
 
-    def __init__(self, llm_client: LLMClient):
-        super().__init__(llm_client)
+    def __init__(self, llm_client: LLMClient, side_effect_mgr=None, env=None, max_iterations: int = 5):
+        super().__init__(llm_client, side_effect_mgr=side_effect_mgr, env=env, max_iterations=max_iterations)
         self._skill_doc = self._load_skill_doc()
 
         # 确保底层工具已注册（供 _execute_with_side_effects 使用）
@@ -172,6 +172,10 @@ class SkillAgent(BaseAgent):
         if cmd_text.upper() == "FINISH":
             return thought, None
 
+        if not cmd_text:
+            log.error("响应中未找到 Command 段")
+            return thought, PARSE_FAILED
+
         # 提取 ```bash ... ``` 代码块
         bash_match = re.search(r"```(?:bash)?\s*\n?(.*?)\n?```", cmd_text, re.DOTALL)
         if bash_match:
@@ -188,7 +192,7 @@ class SkillAgent(BaseAgent):
         # 从命令中解析出子命令名和参数
         tool_name, args = self._parse_cli_command(raw_cmd)
         if not tool_name:
-            return thought, None
+            return thought, PARSE_FAILED
 
         # 映射到 registry 工具名
         registry_name = CLI_TO_REGISTRY.get(tool_name, tool_name)

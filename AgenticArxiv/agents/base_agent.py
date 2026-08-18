@@ -9,10 +9,35 @@ from utils.llm_client import LLMClient
 from utils.logger import log
 from config import settings
 from models.schemas import Paper
-from models.store import store
-from services.log_service import log_service
-from services.runtime import translate_runner, event_bus
 from tools.tool_registry import registry
+from agents.side_effects import SideEffectManager, LocalSideEffectManager
+
+
+class _ParseFailed:
+    """哨兵：表示 LLM 输出无法解析（区别于真正的 FINISH）。
+
+    历史实现里解析失败与 FINISH 都返回 None，导致"输出乱码 == 任务成功 == +1.0 奖励"，
+    是一个可被策略利用的 reward hacking 入口。引入哨兵后二者可区分。
+    """
+
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __repr__(self) -> str:
+        return "<PARSE_FAILED>"
+
+    def __bool__(self) -> bool:
+        return False
+
+
+PARSE_FAILED = _ParseFailed()
+
+# 非工具调用的动作标记（用于指标提取时跳过）
+TERMINAL_ACTIONS = ("FINISH", "FORCE_STOP", "ERROR", "PARSE_ERROR")
 
 
 class BaseAgent(ABC):
@@ -20,9 +45,25 @@ class BaseAgent(ABC):
 
     agent_type: str = "regex"  # 子类覆写
 
-    def __init__(self, llm_client: LLMClient):
+    def __init__(
+        self,
+        llm_client: LLMClient,
+        side_effect_mgr: Optional[SideEffectManager] = None,
+        env: Optional[Any] = None,
+        max_iterations: int = 5,
+    ):
+        """
+        Args:
+            llm_client: LLM 调用客户端（策略）
+            side_effect_mgr: 副作用管理器；默认 LocalSideEffectManager（无 DB/SSE）
+            env: 可选的工具执行环境（需实现 execute_tool(name, args)）。
+                 传入 MockArxivEnv 即可让 rollout 走快照回放而非真实 API。
+            max_iterations: ReAct 最大迭代轮数
+        """
         self.llm_client = llm_client
-        self.max_iterations = 5
+        self.side_effects = side_effect_mgr or LocalSideEffectManager()
+        self.env = env
+        self.max_iterations = max_iterations
         self.session_id = "default"
 
     # ---------- 子类必须实现 ----------
@@ -39,7 +80,13 @@ class BaseAgent(ABC):
 
     @abstractmethod
     def parse_response(self, raw_response: Dict) -> Tuple[str, Optional[Dict[str, Any]]]:
-        """解析 LLM 响应。返回 (thought, action_dict | None 表示 FINISH)"""
+        """解析 LLM 响应。
+
+        返回 (thought, action)：
+          - action 为 dict          → 正常工具调用
+          - action 为 None          → 模型主动 FINISH
+          - action 为 PARSE_FAILED  → 无法解析（将计入 parse_failures 惩罚）
+        """
 
     @abstractmethod
     def invoke_tool(self, tool_name: str, args: Dict[str, Any]) -> Any:
@@ -75,7 +122,9 @@ class BaseAgent(ABC):
             agent_model = settings.models.agent_model
 
         try:
-            log_service.create_chat_log(session_id, msg_id, "user", task, model=agent_model, agent_type=self.agent_type)
+            self.side_effects.create_chat_log(
+                session_id, msg_id, "user", task, model=agent_model, agent_type=self.agent_type
+            )
         except Exception as e:
             log.warning(f"Failed to log user message: {e}")
 
@@ -85,7 +134,7 @@ class BaseAgent(ABC):
         # 注入会话上下文，避免 LLM 重复搜索已缓存的论文
         enriched_task = self._enrich_task_with_context(task, session_id)
 
-        history: List[Dict[str, str]] = []
+        history: List[Dict[str, Any]] = []
         step_timings: List[Dict[str, int]] = []
         token_usage: Dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
@@ -122,10 +171,45 @@ class BaseAgent(ABC):
                 thought, action_dict = self.parse_response(response)
                 log.info(f"Thought: {thought}")
 
+                # --- 解析失败：不再冒充 FINISH，而是回灌错误并继续尝试 ---
+                if action_dict is PARSE_FAILED:
+                    log.warning("Action 解析失败，计入 parse_failures 并要求模型重试")
+                    observation = (
+                        "无法解析你的 Action。请严格按格式输出：\n"
+                        'Action: {"name":"工具名","args":{...}}\n'
+                        "或在任务完成时输出：Action: FINISH"
+                    )
+                    history.append({
+                        "thought": thought,
+                        "action": "PARSE_ERROR",
+                        "observation": observation,
+                        "parse_failed": True,
+                    })
+                    step_timings.append({"llm_ms": llm_ms, "tool_ms": 0})
+                    self._log_step(
+                        msg_id, iteration, thought, "PARSE_ERROR", "",
+                        observation, llm_ms, 0, session_id,
+                    )
+                    if iteration == self.max_iterations - 1:
+                        log.warning("达到最大迭代次数，强制结束")
+                        history.append({
+                            "thought": "达到最大迭代次数", "action": "FORCE_STOP",
+                            "observation": "迭代限制", "parse_failed": False,
+                        })
+                        self._log_step(
+                            msg_id, iteration + 1, "达到最大迭代次数", "FORCE_STOP",
+                            "", "迭代限制", 0, 0, session_id,
+                        )
+                        break
+                    continue
+
                 if action_dict is None:
                     log.info("任务完成")
                     observation = "任务完成"
-                    history.append({"thought": thought, "action": "FINISH", "observation": observation})
+                    history.append({
+                        "thought": thought, "action": "FINISH",
+                        "observation": observation, "parse_failed": False,
+                    })
                     step_timings.append({"llm_ms": llm_ms, "tool_ms": 0})
                     self._log_step(msg_id, iteration, thought, "FINISH", "{}", observation, llm_ms, 0, session_id)
                     break
@@ -139,7 +223,10 @@ class BaseAgent(ABC):
                 step_timings.append({"llm_ms": llm_ms, "tool_ms": tool_ms})
 
                 action_str = json.dumps(action_dict, ensure_ascii=False)
-                history.append({"thought": thought, "action": action_str, "observation": observation})
+                history.append({
+                    "thought": thought, "action": action_str,
+                    "observation": observation, "parse_failed": False,
+                })
 
                 self._log_step(
                     msg_id, iteration, thought,
@@ -149,14 +236,20 @@ class BaseAgent(ABC):
 
                 if iteration == self.max_iterations - 1:
                     log.warning("达到最大迭代次数，强制结束")
-                    history.append({"thought": "达到最大迭代次数", "action": "FORCE_STOP", "observation": "迭代限制"})
+                    history.append({
+                        "thought": "达到最大迭代次数", "action": "FORCE_STOP",
+                        "observation": "迭代限制", "parse_failed": False,
+                    })
                     self._log_step(msg_id, iteration + 1, "达到最大迭代次数", "FORCE_STOP", "", "迭代限制", 0, 0, session_id)
                     break
 
             except Exception as e:
                 error_msg = f"LLM调用失败: {str(e)}"
                 log.error(error_msg)
-                history.append({"thought": "LLM调用失败", "action": "ERROR", "observation": error_msg})
+                history.append({
+                    "thought": "LLM调用失败", "action": "ERROR",
+                    "observation": error_msg, "parse_failed": False,
+                })
                 step_timings.append({"llm_ms": llm_ms, "tool_ms": 0})
                 self._log_step(msg_id, iteration, "LLM调用失败", "ERROR", "", error_msg, llm_ms, 0, session_id)
                 break
@@ -165,13 +258,16 @@ class BaseAgent(ABC):
 
         reply = ""
         for step in reversed(history):
-            if step.get("action") not in ("FINISH", "FORCE_STOP", "ERROR"):
+            if step.get("action") not in TERMINAL_ACTIONS:
                 reply = step.get("observation", "")
                 break
         reply = reply or final_observation
 
         try:
-            log_service.create_chat_log(session_id, msg_id + "_reply", "assistant", reply, model=agent_model, agent_type=self.agent_type)
+            self.side_effects.create_chat_log(
+                session_id, msg_id + "_reply", "assistant", reply,
+                model=agent_model, agent_type=self.agent_type,
+            )
         except Exception as e:
             log.warning(f"Failed to log assistant reply: {e}")
 
@@ -204,7 +300,7 @@ class BaseAgent(ABC):
     def _enrich_task_with_context(self, task: str, session_id: str) -> str:
         """向任务描述注入当前会话状态，帮助 LLM 避免重复操作"""
         try:
-            papers = store.get_last_papers(session_id)
+            papers = self.side_effects.get_last_papers(session_id)
             if papers:
                 titles = [f"  {i+1}. {p.title}" for i, p in enumerate(papers[:10])]
                 ctx = f"\n\n[会话上下文] 当前会话已有 {len(papers)} 篇论文:\n" + "\n".join(titles)
@@ -213,6 +309,14 @@ class BaseAgent(ABC):
         except Exception:
             pass
         return task
+
+    # ---------- 工具执行（可被 env 接管） ----------
+
+    def _dispatch_tool(self, tool_name: str, args: Dict[str, Any]) -> Any:
+        """统一的工具执行入口：注入了 env 就走 env（快照回放），否则走子类实现。"""
+        if self.env is not None:
+            return self.env.execute_tool(tool_name, args)
+        return self.invoke_tool(tool_name, args)
 
     # ---------- 通用副作用逻辑 ----------
 
@@ -240,7 +344,7 @@ class BaseAgent(ABC):
 
             # 翻译工具异步 enqueue
             if tool_name == "translate_arxiv_pdf":
-                t = translate_runner.enqueue(
+                t = self.side_effects.enqueue_translate(
                     session_id=self.session_id,
                     ref=args.get("ref", None),
                     force=bool(args.get("force", False)),
@@ -257,15 +361,15 @@ class BaseAgent(ABC):
                     f"任务完成后刷新 /translate/assets 或 /pdf/assets。"
                 )
 
-            # 调用子类实现的工具执行
-            result = self.invoke_tool(tool_name, args)
+            # 调用工具（env 优先）
+            result = self._dispatch_tool(tool_name, args)
 
             # paper_id 写入 last_active
             try:
                 if isinstance(result, dict):
                     pid = result.get("paper_id")
                     if isinstance(pid, str) and pid.strip():
-                        store.set_last_active_paper_id(self.session_id, pid.strip())
+                        self.side_effects.set_last_active_paper_id(self.session_id, pid.strip())
             except Exception:
                 pass
 
@@ -281,7 +385,7 @@ class BaseAgent(ABC):
                 if isinstance(result, list):
                     if result:
                         papers_obj = [Paper(**p) for p in result]
-                        store.set_last_papers(self.session_id, papers_obj)
+                        self.side_effects.set_last_papers(self.session_id, papers_obj)
                         papers_count = len(result)
                         paper_titles = [paper.get("title", "无标题") for paper in result[:3]]
                         titles_str = "\n".join([f"  - {title}" for title in paper_titles])
@@ -319,13 +423,13 @@ class BaseAgent(ABC):
         session_id: str,
     ):
         try:
-            log_service.save_agent_step(
+            self.side_effects.save_agent_step(
                 msg_id=msg_id, step_index=step_index,
                 thought=thought, action_name=action_name,
                 action_args=action_args, observation=observation,
                 llm_latency_ms=llm_ms, tool_latency_ms=tool_ms,
             )
-            event_bus.publish(session_id, {
+            self.side_effects.publish_sse(session_id, {
                 "type": "agent_step",
                 "step": {
                     "thought": thought, "action_name": action_name,
